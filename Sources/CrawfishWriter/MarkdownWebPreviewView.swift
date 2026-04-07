@@ -2,6 +2,8 @@ import SwiftUI
 import WebKit
 import AppKit
 
+private let previewHoverMessageHandlerName = "crawfishPreviewHover"
+
 struct MarkdownWebPreviewView: NSViewRepresentable {
     let markdown: String
     var onHorizontalSwipe: (CGFloat) -> Void
@@ -12,11 +14,26 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
 
     func makeNSView(context: Context) -> SwipeAwareWebView {
         let config = WKWebViewConfiguration()
+        let userContentController = WKUserContentController()
+        userContentController.addUserScript(
+            WKUserScript(
+                source: MarkdownWebRenderer.previewInteractionScript,
+                injectionTime: .atDocumentEnd,
+                forMainFrameOnly: true
+            )
+        )
+        let weakHandler = WeakScriptMessageHandler(delegate: context.coordinator)
+        userContentController.add(weakHandler, name: previewHoverMessageHandlerName)
+        config.userContentController = userContentController
+
         let webView = SwipeAwareWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
         webView.onHorizontalSwipe = onHorizontalSwipe
+        webView.shouldHandleHorizontalSwipe = { [weak coordinator = context.coordinator] in
+            !(coordinator?.isHoveringScrollableCodeBlock ?? false)
+        }
         configureOverlayScrollbars(for: webView)
         DispatchQueue.main.async {
             configureOverlayScrollbars(for: webView)
@@ -27,6 +44,9 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
 
     func updateNSView(_ nsView: SwipeAwareWebView, context: Context) {
         nsView.onHorizontalSwipe = onHorizontalSwipe
+        nsView.shouldHandleHorizontalSwipe = { [weak coordinator = context.coordinator] in
+            !(coordinator?.isHoveringScrollableCodeBlock ?? false)
+        }
         configureOverlayScrollbars(for: nsView)
         context.coordinator.render(markdown: markdown, in: nsView)
     }
@@ -54,19 +74,47 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         return nil
     }
 
-    final class Coordinator {
+    final class Coordinator: NSObject, WKScriptMessageHandler {
         private var lastMarkdown: String = ""
+        var isHoveringScrollableCodeBlock: Bool = false
 
         func render(markdown: String, in webView: WKWebView) {
             guard markdown != lastMarkdown else { return }
             lastMarkdown = markdown
             webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown), baseURL: nil)
         }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            guard message.name == previewHoverMessageHandlerName else { return }
+            if let value = message.body as? Bool {
+                isHoveringScrollableCodeBlock = value
+                return
+            }
+            if let value = message.body as? NSNumber {
+                isHoveringScrollableCodeBlock = value.boolValue
+                return
+            }
+            isHoveringScrollableCodeBlock = false
+        }
+    }
+
+    final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
+        weak var delegate: WKScriptMessageHandler?
+
+        init(delegate: WKScriptMessageHandler) {
+            self.delegate = delegate
+            super.init()
+        }
+
+        func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+            delegate?.userContentController(userContentController, didReceive: message)
+        }
     }
 }
 
 final class SwipeAwareWebView: WKWebView {
     var onHorizontalSwipe: ((CGFloat) -> Void)?
+    var shouldHandleHorizontalSwipe: (() -> Bool)?
 
     private var horizontalSwipeAccumulator: CGFloat = 0
     private var didEmitHorizontalSwipe = false
@@ -85,6 +133,13 @@ final class SwipeAwareWebView: WKWebView {
         let rawDeltaX = event.scrollingDeltaX
         let rawDeltaY = event.scrollingDeltaY
         guard abs(rawDeltaX) > abs(rawDeltaY), abs(rawDeltaX) > 0.01 else {
+            resetHorizontalSwipeIfEnded(event)
+            return
+        }
+
+        if let shouldHandleHorizontalSwipe, !shouldHandleHorizontalSwipe() {
+            horizontalSwipeAccumulator = 0
+            didEmitHorizontalSwipe = false
             resetHorizontalSwipeIfEnded(event)
             return
         }
@@ -110,6 +165,35 @@ final class SwipeAwareWebView: WKWebView {
 }
 
 enum MarkdownWebRenderer {
+    static let previewInteractionScript = """
+    (() => {
+      const handler = window.webkit?.messageHandlers?.\(previewHoverMessageHandlerName);
+      if (!handler) { return; }
+
+      const isInHorizontallyScrollableCode = (element) => {
+        const pre = element?.closest?.("pre");
+        if (!pre) { return false; }
+        return (pre.scrollWidth - pre.clientWidth) > 1;
+      };
+
+      let lastValue = null;
+      const publish = (value) => {
+        if (lastValue === value) { return; }
+        lastValue = value;
+        handler.postMessage(value);
+      };
+
+      const updateFromEvent = (event) => {
+        publish(isInHorizontallyScrollableCode(event.target));
+      };
+
+      document.addEventListener("mouseover", updateFromEvent, { passive: true });
+      document.addEventListener("mousemove", updateFromEvent, { passive: true });
+      document.addEventListener("mouseleave", () => publish(false), { passive: true });
+      publish(false);
+    })();
+    """
+
     private enum ListType {
         case unordered
         case ordered
@@ -128,6 +212,33 @@ enum MarkdownWebRenderer {
         var type: ListType
         var indent: Int
         var hasOpenListItem: Bool
+    }
+
+    private enum TableAlignment {
+        case left
+        case center
+        case right
+
+        var cssValue: String {
+            switch self {
+            case .left:
+                return "left"
+            case .center:
+                return "center"
+            case .right:
+                return "right"
+            }
+        }
+    }
+
+    private struct TaskListItem {
+        var checked: Bool
+        var content: String
+    }
+
+    private struct LinkReferenceDefinition {
+        var url: String
+        var title: String?
     }
 
     static func htmlDocument(from markdown: String) -> String {
@@ -174,11 +285,34 @@ enum MarkdownWebRenderer {
               box-sizing: border-box;
             }
             ul, ol {
-              margin: 0.8em 0 0.8em 1.4em;
-              padding: 0;
+              margin: 0.8em 0;
+              padding-left: 1.2em;
+              list-style-position: inside;
+            }
+            ul.task-list {
+              list-style: none;
+              padding-left: 0;
+              margin-left: 0;
+            }
+            ul.task-list li {
+              display: flex;
+              align-items: flex-start;
+              gap: 0.48em;
+              margin: 0.28em 0;
+            }
+            ul.task-list input[type="checkbox"] {
+              margin-top: 0.18em;
+              accent-color: #3b6ea9;
+            }
+            ul.task-list .task-text {
+              flex: 1;
             }
             li {
               margin: 0.2em 0;
+            }
+            li > ul, li > ol {
+              margin: 0.35em 0 0.35em 1.1em;
+              padding-left: 0.9em;
             }
             h1, h2, h3, h4, h5, h6 {
               line-height: 1.28;
@@ -239,7 +373,65 @@ enum MarkdownWebRenderer {
               padding: 0.5em 0.65em;
               text-align: left;
             }
+            .math-block {
+              margin: 1.05em 0;
+              overflow-x: auto;
+            }
+            .math-block mjx-container[display="true"] {
+              margin: 0.2em 0 !important;
+            }
+            .math-inline mjx-container {
+              margin: 0 !important;
+            }
+            dl {
+              margin: 0.95em 0;
+            }
+            dt {
+              margin-top: 0.45em;
+              font-weight: 600;
+            }
+            dd {
+              margin: 0.18em 0 0.58em 1.25em;
+              color: var(--muted);
+            }
+            .mention, .hashtag {
+              color: var(--link);
+              font-weight: 600;
+            }
+            .footnote-ref a {
+              text-decoration: none;
+              font-size: 0.86em;
+              vertical-align: super;
+            }
+            .footnotes {
+              margin-top: 1.75em;
+              color: var(--muted);
+              font-size: 0.93em;
+            }
+            .footnotes ol {
+              padding-left: 1.25em;
+            }
+            .footnotes li {
+              margin: 0.3em 0;
+            }
+            .footnote-backref {
+              text-decoration: none;
+              margin-left: 0.34em;
+            }
           </style>
+          <script>
+            window.MathJax = {
+              tex: {
+                inlineMath: [["\\\\(", "\\\\)"]],
+                displayMath: [["\\\\[", "\\\\]"]],
+                processEscapes: true
+              },
+              options: {
+                skipHtmlTags: ["script", "noscript", "style", "textarea", "pre", "code"]
+              }
+            };
+          </script>
+          <script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
         </head>
         <body>
           <main class="wrap">\(bodyHTML)</main>
@@ -256,12 +448,28 @@ enum MarkdownWebRenderer {
         let normalized = markdown
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
-        let lines = normalized.components(separatedBy: "\n")
+        let rawLines = normalized.components(separatedBy: "\n")
+        let extraction = extractDefinitions(from: rawLines)
+        let lines = extraction.contentLines
+        let linkDefinitions = extraction.linkDefinitions
+        let footnoteDefinitions = extraction.footnoteDefinitions
 
         var htmlParts: [String] = []
         var paragraphBuffer: [String] = []
         var listStack: [ListContext] = []
+        var footnoteOrder: [String] = []
+        var footnoteIndexByID: [String: Int] = [:]
         var index = 0
+
+        func parseInlineContent(_ text: String, trackFootnotes: Bool = true) -> String {
+            Self.parseInline(
+                text,
+                linkDefinitions: linkDefinitions,
+                footnoteIndexByID: &footnoteIndexByID,
+                footnoteOrder: &footnoteOrder,
+                collectFootnoteReferences: trackFootnotes
+            )
+        }
 
         func closeCurrentListItemIfNeeded() {
             guard !listStack.isEmpty else { return }
@@ -297,7 +505,7 @@ enum MarkdownWebRenderer {
 
         func flushParagraphIfNeeded() {
             guard !paragraphBuffer.isEmpty else { return }
-            let inline = paragraphBuffer.map(parseInline).joined(separator: "<br/>")
+            let inline = paragraphBuffer.map { parseInlineContent($0) }.joined(separator: "<br/>")
             htmlParts.append("<p>\(inline)</p>")
             paragraphBuffer.removeAll(keepingCapacity: true)
         }
@@ -337,8 +545,13 @@ enum MarkdownWebRenderer {
                 openList(type, indent: indent)
             }
 
-            htmlParts.append("<li>\(parseInline(text))")
+            htmlParts.append("<li>\(parseInlineContent(text))")
             listStack[listStack.count - 1].hasOpenListItem = true
+        }
+
+        func renderTaskListItemHTML(_ item: TaskListItem) -> String {
+            let checkedAttribute = item.checked ? " checked" : ""
+            return "<li><input type=\"checkbox\" disabled\(checkedAttribute) /><span class=\"task-text\">\(parseInlineContent(item.content))</span></li>"
         }
 
         while index < lines.count {
@@ -369,6 +582,35 @@ enum MarkdownWebRenderer {
                 continue
             }
 
+            if let singleLineMath = parseSingleLineDisplayMath(line) {
+                flushParagraphIfNeeded()
+                closeAllLists()
+                htmlParts.append("<div class=\"math-block\">\\[\(escapeHTML(singleLineMath))\\]</div>")
+                index += 1
+                continue
+            }
+
+            if trimmed == "$$" {
+                flushParagraphIfNeeded()
+                closeAllLists()
+
+                var mathLines: [String] = []
+                index += 1
+                while index < lines.count {
+                    let current = lines[index]
+                    if current.trimmingCharacters(in: .whitespaces) == "$$" {
+                        index += 1
+                        break
+                    }
+                    mathLines.append(current)
+                    index += 1
+                }
+
+                let expression = mathLines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+                htmlParts.append("<div class=\"math-block\">\\[\(escapeHTML(expression))\\]</div>")
+                continue
+            }
+
             if trimmed.isEmpty {
                 flushParagraphIfNeeded()
                 closeAllLists()
@@ -376,11 +618,115 @@ enum MarkdownWebRenderer {
                 continue
             }
 
+            if line.range(of: #"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$"#, options: .regularExpression) != nil {
+                flushParagraphIfNeeded()
+                closeAllLists()
+                htmlParts.append("<hr/>")
+                index += 1
+                continue
+            }
+
+            if trimmed.lowercased().hasPrefix("<details") {
+                flushParagraphIfNeeded()
+                closeAllLists()
+
+                var htmlBlockLines: [String] = [line]
+                index += 1
+                while index < lines.count {
+                    let current = lines[index]
+                    htmlBlockLines.append(current)
+                    index += 1
+                    if current.trimmingCharacters(in: .whitespaces).lowercased().hasPrefix("</details") {
+                        break
+                    }
+                }
+
+                htmlParts.append(htmlBlockLines.joined(separator: "\n"))
+                continue
+            }
+
+            if index + 1 < lines.count,
+               isDefinitionListTermLine(line),
+               parseDefinitionListLine(lines[index + 1]) != nil {
+                flushParagraphIfNeeded()
+                closeAllLists()
+
+                htmlParts.append("<dl>")
+                var rowIndex = index
+                while rowIndex < lines.count {
+                    let termLine = lines[rowIndex]
+                    let trimmedTerm = termLine.trimmingCharacters(in: .whitespaces)
+                    guard !trimmedTerm.isEmpty,
+                          isDefinitionListTermLine(termLine),
+                          rowIndex + 1 < lines.count,
+                          parseDefinitionListLine(lines[rowIndex + 1]) != nil else {
+                        break
+                    }
+
+                    htmlParts.append("<dt>\(parseInlineContent(trimmedTerm))</dt>")
+                    var definitionIndex = rowIndex + 1
+                    while definitionIndex < lines.count,
+                          let definitionText = parseDefinitionListLine(lines[definitionIndex]) {
+                        htmlParts.append("<dd>\(parseInlineContent(definitionText))</dd>")
+                        definitionIndex += 1
+                    }
+                    rowIndex = definitionIndex
+                }
+                htmlParts.append("</dl>")
+                index = rowIndex
+                continue
+            }
+
+            if index + 1 < lines.count,
+               let headerCells = parseTableRow(lines[index]),
+               let alignments = parseTableDivider(lines[index + 1], expectedColumnCount: headerCells.count) {
+                flushParagraphIfNeeded()
+                closeAllLists()
+
+                htmlParts.append("<table><thead><tr>")
+                for (columnIndex, rawCell) in headerCells.enumerated() {
+                    let alignmentAttribute = tableAlignmentAttribute(alignments[columnIndex])
+                    htmlParts.append("<th\(alignmentAttribute)>\(parseInlineContent(rawCell))</th>")
+                }
+                htmlParts.append("</tr></thead>")
+
+                var bodyRows: [[String]] = []
+                var rowIndex = index + 2
+                while rowIndex < lines.count {
+                    let candidate = lines[rowIndex]
+                    if candidate.trimmingCharacters(in: .whitespaces).isEmpty {
+                        break
+                    }
+                    guard let parsedRow = parseTableRow(candidate) else {
+                        break
+                    }
+                    bodyRows.append(normalizeTableCells(parsedRow, expectedColumnCount: headerCells.count))
+                    rowIndex += 1
+                }
+
+                if !bodyRows.isEmpty {
+                    htmlParts.append("<tbody>")
+                    for row in bodyRows {
+                        htmlParts.append("<tr>")
+                        for (columnIndex, rawCell) in row.enumerated() {
+                            let alignmentAttribute = tableAlignmentAttribute(alignments[columnIndex])
+                            htmlParts.append("<td\(alignmentAttribute)>\(parseInlineContent(rawCell))</td>")
+                        }
+                        htmlParts.append("</tr>")
+                    }
+                    htmlParts.append("</tbody>")
+                }
+
+                htmlParts.append("</table>")
+                index = rowIndex
+                continue
+            }
+
             if let heading = captureGroups(in: line, pattern: #"^(#{1,6})\s+(.+?)\s*$"#) {
                 flushParagraphIfNeeded()
                 closeAllLists()
                 let level = heading[1].count
-                let content = parseInline(heading[2])
+                let content = parseInlineContent(heading[2])
                 htmlParts.append("<h\(level)>\(content)</h\(level)>")
                 index += 1
                 continue
@@ -398,11 +744,32 @@ enum MarkdownWebRenderer {
                         pattern: #"^\s*>\s?"#,
                         with: ""
                     )
-                    quoteLines.append(parseInline(stripped))
+                    quoteLines.append(parseInlineContent(stripped))
                     index += 1
                 }
 
                 htmlParts.append("<blockquote><p>\(quoteLines.joined(separator: "<br/>"))</p></blockquote>")
+                continue
+            }
+
+            if let firstTask = parseTaskListLine(line) {
+                flushParagraphIfNeeded()
+                closeAllLists()
+
+                var items: [TaskListItem] = [firstTask]
+                var rowIndex = index + 1
+                while rowIndex < lines.count, let item = parseTaskListLine(lines[rowIndex]) {
+                    items.append(item)
+                    rowIndex += 1
+                }
+
+                htmlParts.append("<ul class=\"task-list\">")
+                for item in items {
+                    htmlParts.append(renderTaskListItemHTML(item))
+                }
+                htmlParts.append("</ul>")
+
+                index = rowIndex
                 continue
             }
 
@@ -429,6 +796,25 @@ enum MarkdownWebRenderer {
 
         flushParagraphIfNeeded()
         closeAllLists()
+
+        if !footnoteOrder.isEmpty {
+            htmlParts.append("<section class=\"footnotes\">")
+            htmlParts.append("<hr/>")
+            htmlParts.append("<ol>")
+            for footnoteID in footnoteOrder {
+                let safeID = safeAnchorID(for: footnoteID)
+                let body: String
+                if let definition = footnoteDefinitions[footnoteID], !definition.isEmpty {
+                    body = parseInlineContent(definition, trackFootnotes: false)
+                } else {
+                    body = "<em>Missing footnote definition.</em>"
+                }
+                htmlParts.append("<li id=\"fn:\(safeID)\">\(body) <a class=\"footnote-backref\" href=\"#fnref:\(safeID)\">↩</a></li>")
+            }
+            htmlParts.append("</ol>")
+            htmlParts.append("</section>")
+        }
+
         return htmlParts.joined(separator: "\n")
     }
 
@@ -439,14 +825,114 @@ enum MarkdownWebRenderer {
             .replacingOccurrences(of: ">", with: "&gt;")
     }
 
-    private static func parseInline(_ text: String) -> String {
+    private static func parseInline(
+        _ text: String,
+        linkDefinitions: [String: LinkReferenceDefinition],
+        footnoteIndexByID: inout [String: Int],
+        footnoteOrder: inout [String],
+        collectFootnoteReferences: Bool = true
+    ) -> String {
         var working = text
+        var escapedLiterals: [String] = []
         var codeSnippets: [String] = []
+        var mathSnippets: [String] = []
+        var rawHTMLTags: [String] = []
+        var preservedSnippets: [String] = []
+
+        func preserveSnippet(_ html: String) -> String {
+            let token = "@@CWTOKENSNIP\(preservedSnippets.count)@@"
+            preservedSnippets.append(html)
+            return token
+        }
+
+        working = replacingMatches(in: working, pattern: #"\\([\\`*_{}\[\]()#+\-.!|~$]+)"#) { match, ns in
+            let literal = ns.substring(with: match.range(at: 1))
+            let token = "@@CWTOKENESC\(escapedLiterals.count)@@"
+            escapedLiterals.append(escapeHTML(literal))
+            return token
+        }
 
         working = replacingMatches(in: working, pattern: #"`([^`]+)`"#) { match, ns in
             let codeText = ns.substring(with: match.range(at: 1))
-            let token = "__CODETOKEN_\(codeSnippets.count)__"
+            let token = "@@CWTOKENCODE\(codeSnippets.count)@@"
             codeSnippets.append("<code>\(escapeHTML(codeText))</code>")
+            return token
+        }
+
+        working = replacingMatches(in: working, pattern: #"(?<!\$)\$([^$\n]+?)\$(?!\$)"#) { match, ns in
+            let expression = ns.substring(with: match.range(at: 1)).trimmingCharacters(in: .whitespacesAndNewlines)
+            let token = "@@CWTOKENMATH\(mathSnippets.count)@@"
+            mathSnippets.append("<span class=\"math-inline\">\\(\(escapeHTML(expression))\\)</span>")
+            return token
+        }
+
+        if collectFootnoteReferences {
+            working = replacingMatches(in: working, pattern: #"\[\^([^\]]+)\]"#) { match, ns in
+                let rawID = ns.substring(with: match.range(at: 1))
+                let normalizedID = normalizeReferenceKey(rawID)
+                let index: Int
+                if let existing = footnoteIndexByID[normalizedID] {
+                    index = existing
+                } else {
+                    index = footnoteOrder.count + 1
+                    footnoteIndexByID[normalizedID] = index
+                    footnoteOrder.append(normalizedID)
+                }
+
+                let safeID = safeAnchorID(for: normalizedID)
+                let html = "<sup class=\"footnote-ref\"><a id=\"fnref:\(safeID)\" href=\"#fn:\(safeID)\">[\(index)]</a></sup>"
+                return preserveSnippet(html)
+            }
+        }
+
+        working = replacingMatches(in: working, pattern: #"<((?:https?|ftp)://[^>\s]+)>"#) { match, ns in
+            let url = cleanURL(ns.substring(with: match.range(at: 1)))
+            let html = "<a href=\"\(escapeHTML(url))\">\(escapeHTML(url))</a>"
+            return preserveSnippet(html)
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #"<([A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,})>"#,
+            options: [.caseInsensitive]
+        ) { match, ns in
+            let email = ns.substring(with: match.range(at: 1))
+            let html = "<a href=\"mailto:\(escapeHTML(email))\">\(escapeHTML(email))</a>"
+            return preserveSnippet(html)
+        }
+
+        working = replacingMatches(in: working, pattern: #"!\[([^\]]*)\]\[([^\]]+)\]"#) { match, ns in
+            let alt = ns.substring(with: match.range(at: 1))
+            let referenceID = normalizeReferenceKey(ns.substring(with: match.range(at: 2)))
+            guard let definition = linkDefinitions[referenceID] else {
+                return ns.substring(with: match.range(at: 0))
+            }
+
+            let titleAttribute = definition.title.map { " title=\"\(escapeHTML($0))\"" } ?? ""
+            let html = "<img src=\"\(escapeHTML(definition.url))\" alt=\"\(escapeHTML(alt))\"\(titleAttribute) />"
+            return preserveSnippet(html)
+        }
+
+        working = replacingMatches(in: working, pattern: #"!\[([^\]]*)\]\[\]"#) { match, ns in
+            let alt = ns.substring(with: match.range(at: 1))
+            let referenceID = normalizeReferenceKey(alt)
+            guard let definition = linkDefinitions[referenceID] else {
+                return ns.substring(with: match.range(at: 0))
+            }
+
+            let titleAttribute = definition.title.map { " title=\"\(escapeHTML($0))\"" } ?? ""
+            let html = "<img src=\"\(escapeHTML(definition.url))\" alt=\"\(escapeHTML(alt))\"\(titleAttribute) />"
+            return preserveSnippet(html)
+        }
+
+        working = replacingMatches(in: working, pattern: #"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*?)?/?>"#) { match, ns in
+            let tag = ns.substring(with: match.range(at: 0))
+            guard let name = htmlTagName(in: tag),
+                  allowedInlineHTMLTags.contains(name.lowercased()) else {
+                return tag
+            }
+            let token = "@@CWTOKENHTML\(rawHTMLTags.count)@@"
+            rawHTMLTags.append(tag)
             return token
         }
 
@@ -466,6 +952,24 @@ enum MarkdownWebRenderer {
             return "<a href=\"\(escapeHTML(url))\">\(label)</a>"
         }
 
+        working = replacingMatches(in: working, pattern: #"(?<!!)\[([^\]]+)\]\[([^\]]+)\]"#) { match, ns in
+            let label = ns.substring(with: match.range(at: 1))
+            let referenceID = normalizeReferenceKey(ns.substring(with: match.range(at: 2)))
+            guard let definition = linkDefinitions[referenceID] else {
+                return ns.substring(with: match.range(at: 0))
+            }
+            return "<a href=\"\(escapeHTML(definition.url))\">\(label)</a>"
+        }
+
+        working = replacingMatches(in: working, pattern: #"(?<!!)\[([^\]]+)\]\[\]"#) { match, ns in
+            let label = ns.substring(with: match.range(at: 1))
+            let referenceID = normalizeReferenceKey(label)
+            guard let definition = linkDefinitions[referenceID] else {
+                return ns.substring(with: match.range(at: 0))
+            }
+            return "<a href=\"\(escapeHTML(definition.url))\">\(label)</a>"
+        }
+
         working = replacingMatches(in: working, pattern: #"\*\*\*([^*]+?)\*\*\*"#) { match, ns in
             "<strong><em>\(ns.substring(with: match.range(at: 1)))</em></strong>"
         }
@@ -478,6 +982,9 @@ enum MarkdownWebRenderer {
         working = replacingMatches(in: working, pattern: #"__([^_]+?)__"#) { match, ns in
             "<strong>\(ns.substring(with: match.range(at: 1)))</strong>"
         }
+        working = replacingMatches(in: working, pattern: #"~~([^~]+?)~~"#) { match, ns in
+            "<del>\(ns.substring(with: match.range(at: 1)))</del>"
+        }
         working = replacingMatches(in: working, pattern: #"(?<!\*)\*([^*]+?)\*(?!\*)"#) { match, ns in
             "<em>\(ns.substring(with: match.range(at: 1)))</em>"
         }
@@ -485,8 +992,59 @@ enum MarkdownWebRenderer {
             "<em>\(ns.substring(with: match.range(at: 1)))</em>"
         }
 
+        working = replacingMatches(in: working, pattern: #":([a-z0-9_+\-]+):"#, options: [.caseInsensitive]) { match, ns in
+            let shortcode = ns.substring(with: match.range(at: 1)).lowercased()
+            if let emoji = emojiCharacter(for: shortcode) {
+                return emoji
+            }
+            return ns.substring(with: match.range(at: 0))
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #"(?<!["'=\(])((?:https?://)[A-Za-z0-9\-\._~:/?#\[\]@!$&*+,;=%]+)"#
+        ) { match, ns in
+            let rawURL = ns.substring(with: match.range(at: 1))
+            let parts = splitTrailingURLPunctuation(rawURL)
+            let anchor = "<a href=\"\(escapeHTML(parts.url))\">\(escapeHTML(parts.url))</a>"
+            return anchor + escapeHTML(parts.trailing)
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #"(^|\s)(@[A-Za-z0-9_]{1,64})"#,
+            options: [.anchorsMatchLines]
+        ) { match, ns in
+            let leading = ns.substring(with: match.range(at: 1))
+            let mention = ns.substring(with: match.range(at: 2))
+            return "\(leading)<span class=\"mention\">\(mention)</span>"
+        }
+
+        working = replacingMatches(
+            in: working,
+            pattern: #"(^|\s)(#[A-Za-z0-9_][A-Za-z0-9_\-]{0,63})"#,
+            options: [.anchorsMatchLines]
+        ) { match, ns in
+            let leading = ns.substring(with: match.range(at: 1))
+            let hashtag = ns.substring(with: match.range(at: 2))
+            return "\(leading)<span class=\"hashtag\">\(hashtag)</span>"
+        }
+
+        for (index, snippet) in preservedSnippets.enumerated() {
+            working = working.replacingOccurrences(of: "@@CWTOKENSNIP\(index)@@", with: snippet)
+        }
+
+        for (index, snippet) in rawHTMLTags.enumerated() {
+            working = working.replacingOccurrences(of: "@@CWTOKENHTML\(index)@@", with: snippet)
+        }
+        for (index, snippet) in mathSnippets.enumerated() {
+            working = working.replacingOccurrences(of: "@@CWTOKENMATH\(index)@@", with: snippet)
+        }
         for (index, snippet) in codeSnippets.enumerated() {
-            working = working.replacingOccurrences(of: "__CODETOKEN_\(index)__", with: snippet)
+            working = working.replacingOccurrences(of: "@@CWTOKENCODE\(index)@@", with: snippet)
+        }
+        for (index, literal) in escapedLiterals.enumerated() {
+            working = working.replacingOccurrences(of: "@@CWTOKENESC\(index)@@", with: literal)
         }
 
         return working
@@ -564,5 +1122,272 @@ enum MarkdownWebRenderer {
             return String(firstPart)
         }
         return trimmed
+    }
+
+    private static func extractDefinitions(
+        from lines: [String]
+    ) -> (
+        contentLines: [String],
+        linkDefinitions: [String: LinkReferenceDefinition],
+        footnoteDefinitions: [String: String]
+    ) {
+        var contentLines: [String] = []
+        var linkDefinitions: [String: LinkReferenceDefinition] = [:]
+        var footnoteDefinitions: [String: String] = [:]
+
+        var index = 0
+        while index < lines.count {
+            let line = lines[index]
+
+            if let linkGroups = captureGroups(
+                in: line,
+                pattern: #"^\s*\[([^\]]+)\]:\s*(\S+)(?:\s+(?:"([^"]*)"|'([^']*)'|\(([^)]*)\)))?\s*$"#
+            ), linkGroups.count > 2 {
+                let key = normalizeReferenceKey(linkGroups[1])
+                let url = cleanURL(linkGroups[2])
+                let possibleTitles = Array(linkGroups.dropFirst(3))
+                let title = possibleTitles.first { !$0.isEmpty }?.trimmingCharacters(in: .whitespacesAndNewlines)
+                linkDefinitions[key] = LinkReferenceDefinition(url: url, title: title?.isEmpty == true ? nil : title)
+                index += 1
+                continue
+            }
+
+            if let footnoteGroups = captureGroups(in: line, pattern: #"^\s*\[\^([^\]]+)\]:\s*(.+?)\s*$"#),
+               footnoteGroups.count > 2 {
+                let key = normalizeReferenceKey(footnoteGroups[1])
+                var bodyLines: [String] = [footnoteGroups[2]]
+                index += 1
+
+                while index < lines.count {
+                    let continuation = lines[index]
+                    if continuation.range(of: #"^(?:\t| {2,}).+\S"#, options: .regularExpression) != nil {
+                        bodyLines.append(continuation.trimmingCharacters(in: .whitespaces))
+                        index += 1
+                        continue
+                    }
+                    break
+                }
+
+                footnoteDefinitions[key] = bodyLines.joined(separator: "\n")
+                continue
+            }
+
+            contentLines.append(line)
+            index += 1
+        }
+
+        return (contentLines, linkDefinitions, footnoteDefinitions)
+    }
+
+    private static func normalizeReferenceKey(_ raw: String) -> String {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return trimmed.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+    }
+
+    private static func safeAnchorID(for raw: String) -> String {
+        let normalized = normalizeReferenceKey(raw)
+        let replaced = normalized.map { character in
+            character.isLetter || character.isNumber ? character : "-"
+        }
+        var anchor = String(replaced)
+        anchor = anchor.replacingOccurrences(of: #"-{2,}"#, with: "-", options: .regularExpression)
+        anchor = anchor.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+        return anchor.isEmpty ? "note" : anchor
+    }
+
+    private static func parseDefinitionListLine(_ line: String) -> String? {
+        guard let groups = captureGroups(in: line, pattern: #"^\s*:\s+(.+?)\s*$"#),
+              groups.count > 1 else {
+            return nil
+        }
+        return groups[1]
+    }
+
+    private static func isDefinitionListTermLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return false }
+        if parseDefinitionListLine(line) != nil { return false }
+        if trimmed.hasPrefix("#") || trimmed.hasPrefix(">") || trimmed == "$$" || trimmed.hasPrefix("```") {
+            return false
+        }
+        if trimmed.lowercased().hasPrefix("<details") { return false }
+        if captureGroups(in: line, pattern: #"^([ \t]*)([-+*])\s+(.+)$"#) != nil { return false }
+        if captureGroups(in: line, pattern: #"^([ \t]*)(\d+)\.\s+(.+)$"#) != nil { return false }
+        if line.range(of: #"^\s*(?:-{3,}|\*{3,}|_{3,})\s*$"#, options: .regularExpression) != nil { return false }
+        return true
+    }
+
+    private static func splitTrailingURLPunctuation(_ rawURL: String) -> (url: String, trailing: String) {
+        guard !rawURL.isEmpty else { return ("", "") }
+        var url = rawURL
+        var trailing = ""
+
+        while let last = url.last {
+            if ".,!?:;".contains(last) {
+                trailing.insert(last, at: trailing.startIndex)
+                url.removeLast()
+                continue
+            }
+            if last == ")" {
+                let openCount = url.filter { $0 == "(" }.count
+                let closeCount = url.filter { $0 == ")" }.count
+                if closeCount > openCount {
+                    trailing.insert(last, at: trailing.startIndex)
+                    url.removeLast()
+                    continue
+                }
+            }
+            break
+        }
+
+        if url.isEmpty {
+            return (rawURL, "")
+        }
+        return (url, trailing)
+    }
+
+    private static let emojiShortcodeMap: [String: String] = [
+        "smile": "😄",
+        "rocket": "🚀",
+        "warning": "⚠️",
+        "check": "✅",
+        "x": "❌",
+        "fire": "🔥",
+        "star": "⭐",
+        "sparkles": "✨",
+        "thumbsup": "👍",
+        "thumbsdown": "👎"
+    ]
+
+    private static func emojiCharacter(for shortcode: String) -> String? {
+        emojiShortcodeMap[shortcode]
+    }
+
+    private static let allowedInlineHTMLTags: Set<String> = [
+        "a", "abbr", "b", "blockquote", "br", "code", "del", "details", "em", "i", "ins",
+        "kbd", "mark", "p", "pre", "s", "small", "span", "strong", "sub", "summary",
+        "sup", "u"
+    ]
+
+    private static func htmlTagName(in tag: String) -> String? {
+        guard let groups = captureGroups(in: tag, pattern: #"^</?\s*([A-Za-z][A-Za-z0-9:-]*)"#),
+              groups.count > 1 else {
+            return nil
+        }
+        return groups[1]
+    }
+
+    private static func parseSingleLineDisplayMath(_ line: String) -> String? {
+        guard let groups = captureGroups(in: line, pattern: #"^\s*\$\$(.+?)\$\$\s*$"#),
+              groups.count > 1 else {
+            return nil
+        }
+        return groups[1].trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func parseTaskListLine(_ line: String) -> TaskListItem? {
+        guard let groups = captureGroups(in: line, pattern: #"^\s*(?:[-+*]\s+)?\[( |x|X)\]\s+(.+?)\s*$"#),
+              groups.count > 2 else {
+            return nil
+        }
+        let marker = groups[1].lowercased()
+        let content = groups[2]
+        return TaskListItem(checked: marker == "x", content: content)
+    }
+
+    private static func parseTableRow(_ line: String) -> [String]? {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        guard trimmed.contains("|") else { return nil }
+
+        var working = trimmed
+        if working.hasPrefix("|") {
+            working.removeFirst()
+        }
+        if working.hasSuffix("|") {
+            working.removeLast()
+        }
+
+        let cells = splitTableCells(in: working).map { cell in
+            cell.trimmingCharacters(in: .whitespaces)
+        }
+        guard !cells.isEmpty else { return nil }
+        return cells
+    }
+
+    private static func parseTableDivider(_ line: String, expectedColumnCount: Int) -> [TableAlignment?]? {
+        let rawCells = parseTableRow(line)
+        guard let rawCells else { return nil }
+
+        let dividerCells = normalizeTableCells(rawCells, expectedColumnCount: expectedColumnCount)
+        var alignments: [TableAlignment?] = []
+        alignments.reserveCapacity(expectedColumnCount)
+
+        for rawCell in dividerCells {
+            let marker = rawCell.replacingOccurrences(of: " ", with: "")
+            guard marker.range(of: #"^:?-{3,}:?$"#, options: .regularExpression) != nil else {
+                return nil
+            }
+
+            let startsWithColon = marker.hasPrefix(":")
+            let endsWithColon = marker.hasSuffix(":")
+            if startsWithColon && endsWithColon {
+                alignments.append(.center)
+            } else if endsWithColon {
+                alignments.append(.right)
+            } else if startsWithColon {
+                alignments.append(.left)
+            } else {
+                alignments.append(nil)
+            }
+        }
+
+        return alignments
+    }
+
+    private static func normalizeTableCells(_ cells: [String], expectedColumnCount: Int) -> [String] {
+        guard expectedColumnCount > 0 else { return [] }
+
+        if cells.count == expectedColumnCount {
+            return cells
+        }
+
+        if cells.count > expectedColumnCount {
+            return Array(cells.prefix(expectedColumnCount))
+        }
+
+        var normalized = cells
+        normalized.append(contentsOf: repeatElement("", count: expectedColumnCount - cells.count))
+        return normalized
+    }
+
+    private static func tableAlignmentAttribute(_ alignment: TableAlignment?) -> String {
+        guard let alignment else { return "" }
+        return " style=\"text-align:\(alignment.cssValue);\""
+    }
+
+    private static func splitTableCells(in row: String) -> [String] {
+        var cells: [String] = []
+        cells.reserveCapacity(4)
+
+        var current = ""
+        var isEscaped = false
+
+        for character in row {
+            if character == "|" && !isEscaped {
+                cells.append(current)
+                current = ""
+                continue
+            }
+
+            current.append(character)
+            if character == "\\" {
+                isEscaped.toggle()
+            } else {
+                isEscaped = false
+            }
+        }
+
+        cells.append(current)
+        return cells
     }
 }

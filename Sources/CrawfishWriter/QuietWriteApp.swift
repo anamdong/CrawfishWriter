@@ -3,12 +3,42 @@ import AppKit
 
 @main
 struct CrawfishWriterApp: App {
+    @NSApplicationDelegateAdaptor(CrawfishWriterAppDelegate.self) private var appDelegate
+    private let minimumContentWidth: CGFloat = 620
+    private let minimumContentHeight: CGFloat = 420
+
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .frame(minWidth: minimumContentWidth, minHeight: minimumContentHeight)
         }
+        .defaultSize(width: 980, height: 700)
+        .windowResizability(.contentMinSize)
         .commands {
             WriterCommands()
+        }
+    }
+}
+
+final class CrawfishWriterAppDelegate: NSObject, NSApplicationDelegate {
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        enqueue(urls: [URL(fileURLWithPath: filename)])
+        return true
+    }
+
+    func application(_ sender: NSApplication, openFiles filenames: [String]) {
+        let urls = filenames.map { URL(fileURLWithPath: $0) }
+        enqueue(urls: urls)
+        sender.reply(toOpenOrPrint: .success)
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        enqueue(urls: urls)
+    }
+
+    private func enqueue(urls: [URL]) {
+        Task { @MainActor in
+            ExternalFileOpenRouter.shared.enqueue(urls: urls)
         }
     }
 }
@@ -52,6 +82,14 @@ private struct WriterCommands: Commands {
             .disabled(appState == nil)
         }
 
+        CommandGroup(replacing: .printItem) {
+            Button("Print…") {
+                appState?.printDocument()
+            }
+            .keyboardShortcut("p", modifiers: .command)
+            .disabled(appState == nil)
+        }
+
         CommandGroup(after: .saveItem) {
             Divider()
 
@@ -74,6 +112,14 @@ private struct WriterCommands: Commands {
                 .keyboardShortcut("d", modifiers: [.command, .shift])
                 .disabled(appState == nil)
             }
+        }
+
+        CommandMenu("AI") {
+            Button("Summarize Current Document") {
+                appState?.requestDocumentSummaryUsingAI()
+            }
+            .keyboardShortcut("m", modifiers: [.command, .shift])
+            .disabled(appState == nil)
         }
 
         CommandMenu("View") {

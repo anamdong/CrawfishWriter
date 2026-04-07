@@ -9,6 +9,7 @@ final class AppState: ObservableObject {
     @Published var focusMode: FocusMode = .off
     @Published var editorFontSize: CGFloat = 17
     @Published var useDarkMode: Bool = false
+    @Published var summarizeDocumentRequestID: Int = 0
     @Published var documentURL: URL? {
         didSet { refreshWindowDocumentMetadata() }
     }
@@ -21,6 +22,8 @@ final class AppState: ObservableObject {
     let minimumEditorFontSize: CGFloat = 12
     let maximumEditorFontSize: CGFloat = 30
     private let defaultDocumentTitle = "Untitled.md"
+    private let minimumWindowFrameSize = NSSize(width: 660, height: 500)
+    private let minimumWindowContentSize = NSSize(width: 620, height: 420)
 
     var canExportDOCX: Bool {
         if #available(macOS 13.0, *) {
@@ -70,6 +73,10 @@ final class AppState: ObservableObject {
         }
     }
 
+    func requestDocumentSummaryUsingAI() {
+        summarizeDocumentRequestID &+= 1
+    }
+
     var characterCount: Int {
         text.count
     }
@@ -89,6 +96,8 @@ final class AppState: ObservableObject {
             window.styleMask.insert(.miniaturizable)
             window.styleMask.insert(.resizable)
             window.styleMask.insert(.fullSizeContentView)
+            window.minSize = minimumWindowFrameSize
+            window.contentMinSize = minimumWindowContentSize
             window.titleVisibility = .visible
             window.titlebarAppearsTransparent = true
             window.toolbar = nil
@@ -112,6 +121,7 @@ final class AppState: ObservableObject {
                 control.isEnabled = true
                 control.alphaValue = 1
             }
+            clampWindowSizeIfNeeded(window)
         }
 
         applyAppearance(to: window)
@@ -121,6 +131,18 @@ final class AppState: ObservableObject {
     private func applyAppearance(to window: NSWindow) {
         window.appearance = NSAppearance(named: useDarkMode ? .darkAqua : .aqua)
         window.backgroundColor = .windowBackgroundColor
+    }
+
+    private func clampWindowSizeIfNeeded(_ window: NSWindow) {
+        let adjustedFrameWidth = max(window.frame.width, minimumWindowFrameSize.width)
+        let adjustedFrameHeight = max(window.frame.height, minimumWindowFrameSize.height)
+        guard abs(window.frame.width - adjustedFrameWidth) > 0.5 || abs(window.frame.height - adjustedFrameHeight) > 0.5 else {
+            return
+        }
+
+        var adjustedFrame = window.frame
+        adjustedFrame.size = NSSize(width: adjustedFrameWidth, height: adjustedFrameHeight)
+        window.setFrame(adjustedFrame, display: true)
     }
 
     private func refreshWindowDocumentMetadata() {
@@ -156,9 +178,15 @@ final class AppState: ObservableObject {
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
         do {
-            text = try Self.readText(from: url)
-            documentURL = url
-            isDirty = false
+            try openDocument(at: url, shouldConfirmDiscard: false)
+        } catch {
+            present(error: error)
+        }
+    }
+
+    func openDocument(at url: URL) {
+        do {
+            try openDocument(at: url, shouldConfirmDiscard: true)
         } catch {
             present(error: error)
         }
@@ -195,11 +223,14 @@ final class AppState: ObservableObject {
         panel.prompt = "Export"
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        do {
-            try DocumentExporter.exportPDF(markdown: text, to: url)
-        } catch {
-            present(error: error)
+        let markdown = text
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await DocumentExporter.exportPDF(markdown: markdown, to: url)
+            } catch {
+                self.present(error: error)
+            }
         }
     }
 
@@ -236,6 +267,18 @@ final class AppState: ObservableObject {
             try DocumentExporter.exportDOCX(markdown: text, to: url)
         } catch {
             present(error: error)
+        }
+    }
+
+    func printDocument() {
+        let markdown = text
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await DocumentExporter.printPreview(markdown: markdown)
+            } catch {
+                self.present(error: error)
+            }
         }
     }
 
@@ -288,6 +331,26 @@ final class AppState: ObservableObject {
 
     private static func readText(from url: URL) throws -> String {
         let data = try Data(contentsOf: url)
+        let fileExtension = url.pathExtension.lowercased()
+
+        if fileExtension == "rtf",
+           let attributed = try? NSAttributedString(
+               data: data,
+               options: [.documentType: NSAttributedString.DocumentType.rtf],
+               documentAttributes: nil
+           ) {
+            return attributed.string
+        }
+
+        if (fileExtension == "html" || fileExtension == "htm"),
+           let attributed = try? NSAttributedString(
+               data: data,
+               options: [.documentType: NSAttributedString.DocumentType.html],
+               documentAttributes: nil
+           ) {
+            return attributed.string
+        }
+
         if let value = String(data: data, encoding: .utf8) {
             return value
         }
@@ -300,13 +363,26 @@ final class AppState: ObservableObject {
         throw AppStateError.unreadableTextEncoding
     }
 
+    private func openDocument(at url: URL, shouldConfirmDiscard: Bool) throws {
+        if shouldConfirmDiscard {
+            guard confirmDiscardIfNeeded() else { return }
+        }
+        text = try Self.readText(from: url)
+        documentURL = url
+        isDirty = false
+    }
+
     private func openableContentTypes() -> [UTType] {
         var types: [UTType] = [.plainText, .text]
-        if let md = UTType(filenameExtension: "md") {
-            types.append(md)
-        }
-        if let markdown = UTType(filenameExtension: "markdown") {
-            types.append(markdown)
+        let extensions = [
+            "md", "markdown", "txt", "text", "rtf",
+            "html", "htm", "xml", "json", "csv", "tsv",
+            "log", "yaml", "yml"
+        ]
+        for fileExtension in extensions {
+            if let type = UTType(filenameExtension: fileExtension) {
+                types.append(type)
+            }
         }
         return types
     }

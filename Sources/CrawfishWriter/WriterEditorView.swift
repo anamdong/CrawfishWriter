@@ -5,7 +5,9 @@ struct WriterEditorView: NSViewRepresentable {
     @Binding var text: String
     var fontSize: CGFloat
     var focusMode: FocusMode
+    var summarizeDocumentRequestID: Int
     var onHorizontalSwipe: (CGFloat) -> Void
+    var onAIError: (String) -> Void
     var onUserEdit: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -35,6 +37,12 @@ struct WriterEditorView: NSViewRepresentable {
         textView.delegate = context.coordinator
         textView.autoresizingMask = [.width]
         textView.editorFontSize = fontSize
+        textView.onAIError = { [weak coordinator = context.coordinator] message in
+            coordinator?.handleAIError(message)
+        }
+        textView.onCompositionCommit = { [weak coordinator = context.coordinator] in
+            coordinator?.flushComposedText()
+        }
         textView.onHorizontalSwipe = { [weak coordinator = context.coordinator] normalizedDeltaX in
             coordinator?.handleHorizontalSwipe(normalizedDeltaX)
         }
@@ -58,8 +66,18 @@ struct WriterEditorView: NSViewRepresentable {
         guard let textView = context.coordinator.textView else { return }
         textView.editorFontSize = fontSize
         textView.focusMode = focusMode
+        textView.onAIError = { [weak coordinator = context.coordinator] message in
+            coordinator?.handleAIError(message)
+        }
+        textView.onCompositionCommit = { [weak coordinator = context.coordinator] in
+            coordinator?.flushComposedText()
+        }
         textView.onHorizontalSwipe = { [weak coordinator = context.coordinator] normalizedDeltaX in
             coordinator?.handleHorizontalSwipe(normalizedDeltaX)
+        }
+
+        if textView.hasMarkedText() {
+            return
         }
 
         if textView.string != text {
@@ -72,6 +90,8 @@ struct WriterEditorView: NSViewRepresentable {
             textView.scheduleStyling(reason: .fullRefresh)
             context.coordinator.isApplyingExternalChange = false
         }
+
+        textView.handleSummarizeDocumentRequestIfNeeded(requestID: summarizeDocumentRequestID)
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
@@ -104,6 +124,9 @@ struct WriterEditorView: NSViewRepresentable {
         func textDidChange(_ notification: Notification) {
             guard let textView else { return }
             guard !isApplyingExternalChange else { return }
+            if textView.hasMarkedText() {
+                return
+            }
             let value = textView.string
             parent.text = value
             parent.onUserEdit(value)
@@ -111,11 +134,27 @@ struct WriterEditorView: NSViewRepresentable {
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
+            if textView?.hasMarkedText() == true {
+                return
+            }
             textView?.scheduleStyling(reason: .selectionChanged)
         }
 
         func handleHorizontalSwipe(_ normalizedDeltaX: CGFloat) {
             parent.onHorizontalSwipe(normalizedDeltaX)
+        }
+
+        func handleAIError(_ message: String) {
+            parent.onAIError(message)
+        }
+
+        func flushComposedText() {
+            guard let textView else { return }
+            guard !isApplyingExternalChange else { return }
+            let value = textView.string
+            parent.text = value
+            parent.onUserEdit(value)
+            textView.scheduleStyling(reason: .textChanged)
         }
     }
 }
@@ -127,23 +166,12 @@ final class WriterTextView: NSTextView {
         case visibleRangeChanged
         case focusModeChanged
         case fullRefresh
-    }
-
-    enum PartOfSpeech {
-        case noun
-        case verb
-        case adjective
-    }
-
-    struct POSHighlight {
-        let range: NSRange
-        let kind: PartOfSpeech
+        case aiAnimationTick
     }
 
     struct StylingInput {
         let text: String
         let selection: NSRange
-        let visibleRange: NSRange
         let focusMode: FocusMode
         let isDarkMode: Bool
     }
@@ -152,7 +180,6 @@ final class WriterTextView: NSTextView {
         let textLength: Int
         let focusRange: NSRange?
         let isDarkMode: Bool
-        let highlights: [POSHighlight]
     }
 
     var focusMode: FocusMode = .off {
@@ -175,7 +202,10 @@ final class WriterTextView: NSTextView {
             scheduleStyling(reason: .fullRefresh)
         }
     }
+
+    var onCompositionCommit: (() -> Void)?
     var onHorizontalSwipe: ((CGFloat) -> Void)?
+    var onAIError: ((String) -> Void)?
 
     private static let cursorColorLight = NSColor(calibratedRed: 0.76, green: 0.46, blue: 0.46, alpha: 0.95)
     private static let cursorColorDark = NSColor(calibratedRed: 0.86, green: 0.56, blue: 0.56, alpha: 0.95)
@@ -192,8 +222,14 @@ final class WriterTextView: NSTextView {
     private var styleGeneration: Int = 0
     private var applyingStyle = false
     private var isUpdatingColumnLayout = false
+    private var hasDeferredStyleForComposition = false
     private var horizontalSwipeAccumulator: CGFloat = 0
     private var didEmitHorizontalSwipe = false
+    private var lastHandledSummarizeDocumentRequestID: Int = -1
+    private var isRunningAITask = false
+    private var aiGeneratedRanges: [NSRange] = []
+    private var aiGradientPhase: CGFloat = 0
+    private var aiGradientTimer: Timer?
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         super.init(frame: frameRect, textContainer: container)
@@ -207,6 +243,7 @@ final class WriterTextView: NSTextView {
 
     deinit {
         pendingWork?.cancel()
+        aiGradientTimer?.invalidate()
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -218,6 +255,15 @@ final class WriterTextView: NSTextView {
         super.viewDidChangeEffectiveAppearance()
         updateCursorColor()
         scheduleStyling(reason: .fullRefresh)
+    }
+
+    override func unmarkText() {
+        super.unmarkText()
+        onCompositionCommit?()
+        if hasDeferredStyleForComposition {
+            hasDeferredStyleForComposition = false
+            scheduleStyling(reason: .fullRefresh)
+        }
     }
 
     override func keyDown(with event: NSEvent) {
@@ -242,8 +288,37 @@ final class WriterTextView: NSTextView {
         super.scrollWheel(with: event)
     }
 
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let menu = super.menu(for: event) ?? NSMenu(title: "Context")
+        let selection = Self.clamp(range: selectedRange(), upperBound: (string as NSString).length)
+        guard selection.length > 0 else { return menu }
+
+        menu.addItem(.separator())
+        let summarizeItem = NSMenuItem(
+            title: isRunningAITask ? "Summarizing…" : "Summarize using AI",
+            action: #selector(summarizeSelectionUsingAIFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        summarizeItem.target = self
+        summarizeItem.isEnabled = !isRunningAITask
+        menu.addItem(summarizeItem)
+        return menu
+    }
+
+    func handleSummarizeDocumentRequestIfNeeded(requestID: Int) {
+        guard requestID > 0 else { return }
+        guard requestID != lastHandledSummarizeDocumentRequestID else { return }
+        lastHandledSummarizeDocumentRequestID = requestID
+        summarizeCurrentDocumentUsingAI()
+    }
+
     func scheduleStyling(reason: StylingReason) {
         guard !applyingStyle else { return }
+        if hasMarkedText() {
+            hasDeferredStyleForComposition = true
+            pendingWork?.cancel()
+            return
+        }
 
         styleGeneration += 1
         let generation = styleGeneration
@@ -252,7 +327,7 @@ final class WriterTextView: NSTextView {
 
         let delay: TimeInterval
         switch reason {
-        case .focusModeChanged, .fullRefresh:
+        case .focusModeChanged, .fullRefresh, .aiAnimationTick:
             delay = 0
         case .selectionChanged, .visibleRangeChanged:
             delay = 0.03
@@ -283,7 +358,7 @@ final class WriterTextView: NSTextView {
         isAutomaticDashSubstitutionEnabled = false
         isAutomaticQuoteSubstitutionEnabled = false
         isAutomaticTextReplacementEnabled = false
-        isAutomaticSpellingCorrectionEnabled = true
+        isAutomaticSpellingCorrectionEnabled = false
         isGrammarCheckingEnabled = false
         isContinuousSpellCheckingEnabled = false
 
@@ -296,10 +371,7 @@ final class WriterTextView: NSTextView {
         isHorizontallyResizable = false
         isVerticallyResizable = true
         minSize = NSSize(width: 0, height: 0)
-        maxSize = NSSize(
-            width: CGFloat.greatestFiniteMagnitude,
-            height: CGFloat.greatestFiniteMagnitude
-        )
+        maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
 
         textContainer?.lineFragmentPadding = 2
         textContainer?.widthTracksTextView = true
@@ -354,83 +426,31 @@ final class WriterTextView: NSTextView {
         let content = string
         let totalLength = (content as NSString).length
         let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
-        let visibleRange = Self.clamp(range: visibleCharacterRange(totalLength: totalLength), upperBound: totalLength)
         let isDarkMode = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
 
         return StylingInput(
             text: content,
             selection: selection,
-            visibleRange: visibleRange,
             focusMode: focusMode,
             isDarkMode: isDarkMode
         )
     }
 
-    private func visibleCharacterRange(totalLength: Int) -> NSRange {
-        guard totalLength > 0 else { return NSRange(location: 0, length: 0) }
-        guard let layoutManager, let textContainer else {
-            return NSRange(location: 0, length: totalLength)
-        }
-
-        let visibleRect = enclosingScrollView?.contentView.documentVisibleRect ?? bounds
-        let glyphRange = layoutManager.glyphRange(forBoundingRect: visibleRect, in: textContainer)
-        if glyphRange.length == 0 {
-            return NSRange(location: min(selectedRange().location, totalLength), length: 0)
-        }
-
-        let characterRange = layoutManager.characterRange(forGlyphRange: glyphRange, actualGlyphRange: nil)
-        return Self.clamp(range: characterRange, upperBound: totalLength)
-    }
-
     private static func makeStylePlan(from input: StylingInput) -> StylePlan {
         let nsText = input.text as NSString
-        let length = nsText.length
-        let focusRange = focusedRange(for: input.focusMode, selection: input.selection, text: nsText)
-        let analysisRange = analysisRange(
-            textLength: length,
-            selection: input.selection,
-            visibleRange: input.visibleRange,
-            focusRange: focusRange
-        )
-
-        var highlights: [POSHighlight] = []
-        if analysisRange.length > 0 {
-            let tagger = NSLinguisticTagger(tagSchemes: [.lexicalClass], options: 0)
-            tagger.string = input.text
-            let options: NSLinguisticTagger.Options = [.omitPunctuation, .omitWhitespace, .joinNames]
-
-            tagger.enumerateTags(in: analysisRange, unit: .word, scheme: .lexicalClass, options: options) { tag, tokenRange, _ in
-                if let focusRange, NSIntersectionRange(tokenRange, focusRange).length == 0 {
-                    return
-                }
-
-                let kind: PartOfSpeech?
-                switch tag {
-                case .noun:
-                    kind = .noun
-                case .verb:
-                    kind = .verb
-                case .adjective:
-                    kind = .adjective
-                default:
-                    kind = nil
-                }
-
-                guard let kind else { return }
-                highlights.append(POSHighlight(range: tokenRange, kind: kind))
-            }
-        }
-
         return StylePlan(
-            textLength: length,
-            focusRange: focusRange,
-            isDarkMode: input.isDarkMode,
-            highlights: highlights
+            textLength: nsText.length,
+            focusRange: focusedRange(for: input.focusMode, selection: input.selection, text: nsText),
+            isDarkMode: input.isDarkMode
         )
     }
 
     private func apply(plan: StylePlan) {
         guard let textStorage else { return }
+        if hasMarkedText() {
+            hasDeferredStyleForComposition = true
+            return
+        }
         guard textStorage.length == plan.textLength else {
             scheduleStyling(reason: .fullRefresh)
             return
@@ -461,14 +481,7 @@ final class WriterTextView: NSTextView {
             )
         }
 
-        for highlight in plan.highlights {
-            guard NSMaxRange(highlight.range) <= textStorage.length else { continue }
-            textStorage.addAttribute(
-                .foregroundColor,
-                value: Self.highlightColor(for: highlight.kind, darkMode: plan.isDarkMode),
-                range: highlight.range
-            )
-        }
+        applyAIGradientIfNeeded(to: textStorage, darkMode: plan.isDarkMode)
         textStorage.endEditing()
 
         refreshTypingAttributes()
@@ -514,37 +527,6 @@ final class WriterTextView: NSTextView {
         }
 
         return foundRange ?? text.paragraphRange(for: NSRange(location: probe, length: 0))
-    }
-
-    private static func analysisRange(
-        textLength: Int,
-        selection: NSRange,
-        visibleRange: NSRange,
-        focusRange: NSRange?
-    ) -> NSRange {
-        guard textLength > 0 else { return NSRange(location: 0, length: 0) }
-
-        if textLength <= 120_000 {
-            return NSRange(location: 0, length: textLength)
-        }
-
-        var range = expandedRange(around: selection, by: 5_000, upperBound: textLength)
-        let expandedVisible = expandedRange(around: visibleRange, by: 2_000, upperBound: textLength)
-        range = NSUnionRange(range, expandedVisible)
-
-        if let focusRange {
-            let expandedFocus = expandedRange(around: focusRange, by: 1_200, upperBound: textLength)
-            range = NSUnionRange(range, expandedFocus)
-        }
-
-        return clamp(range: range, upperBound: textLength)
-    }
-
-    private static func expandedRange(around range: NSRange, by amount: Int, upperBound: Int) -> NSRange {
-        let safeRange = clamp(range: range, upperBound: upperBound)
-        let lowerBound = max(0, safeRange.location - amount)
-        let upperRangeBound = min(upperBound, safeRange.location + safeRange.length + amount)
-        return NSRange(location: lowerBound, length: max(0, upperRangeBound - lowerBound))
     }
 
     private static func clamp(range: NSRange, upperBound: Int) -> NSRange {
@@ -606,6 +588,211 @@ final class WriterTextView: NSTextView {
         scheduleStyling(reason: .textChanged)
     }
 
+    @objc private func summarizeSelectionUsingAIFromMenu(_ sender: Any?) {
+        summarizeSelectedTextUsingAI()
+    }
+
+    private func summarizeSelectedTextUsingAI() {
+        let currentText = string as NSString
+        let initialRange = Self.clamp(range: selectedRange(), upperBound: currentText.length)
+        guard initialRange.length > 0 else { return }
+        let initialSelectedText = currentText.substring(with: initialRange)
+
+        runAITask(
+            work: { try await AIAssistant.shared.summarizeSelection(initialSelectedText) },
+            onSuccess: { [weak self] summary in
+                guard let self else { return }
+                let nsCurrent = self.string as NSString
+                var replacementRange = initialRange
+                if NSMaxRange(replacementRange) <= nsCurrent.length {
+                    let slice = nsCurrent.substring(with: replacementRange)
+                    if slice != initialSelectedText {
+                        replacementRange = Self.clamp(range: self.selectedRange(), upperBound: nsCurrent.length)
+                    }
+                } else {
+                    replacementRange = Self.clamp(range: self.selectedRange(), upperBound: nsCurrent.length)
+                }
+                self.applyAIGeneratedReplacement(in: replacementRange, with: summary)
+            }
+        )
+    }
+
+    private func summarizeCurrentDocumentUsingAI() {
+        let source = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !source.isEmpty else {
+            onAIError?(AIAssistantError.emptyInput.localizedDescription)
+            return
+        }
+
+        runAITask(
+            work: { try await AIAssistant.shared.summarizeDocument(source) },
+            onSuccess: { [weak self] summary in
+                self?.appendAIDocumentSummary(summary)
+            }
+        )
+    }
+
+    private func appendAIDocumentSummary(_ summary: String) {
+        let trimmedSummary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedSummary.isEmpty else { return }
+
+        let nsText = string as NSString
+        let insertionRange = NSRange(location: nsText.length, length: 0)
+
+        let separator: String
+        if nsText.length == 0 {
+            separator = ""
+        } else if string.hasSuffix("\n\n") {
+            separator = ""
+        } else if string.hasSuffix("\n") {
+            separator = "\n"
+        } else {
+            separator = "\n\n"
+        }
+
+        let block = "\(separator)#ai summary\n\(trimmedSummary)\n"
+        applyAIGeneratedReplacement(in: insertionRange, with: block)
+        scrollRangeToVisible(NSRange(location: insertionRange.location, length: (block as NSString).length))
+    }
+
+    private func runAITask(
+        work: @escaping () async throws -> String,
+        onSuccess: @escaping (String) -> Void
+    ) {
+        guard !isRunningAITask else { return }
+        isRunningAITask = true
+
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await work()
+                await MainActor.run {
+                    self.isRunningAITask = false
+                    onSuccess(result)
+                }
+            } catch {
+                await MainActor.run {
+                    self.isRunningAITask = false
+                    if let localized = error as? LocalizedError, let description = localized.errorDescription {
+                        self.onAIError?(description)
+                    } else {
+                        self.onAIError?(error.localizedDescription)
+                    }
+                }
+            }
+        }
+    }
+
+    private func applyAIGeneratedReplacement(in range: NSRange, with replacement: String) {
+        let safeRange = Self.clamp(range: range, upperBound: (string as NSString).length)
+        guard shouldChangeText(in: safeRange, replacementString: replacement) else { return }
+
+        textStorage?.replaceCharacters(in: safeRange, with: replacement)
+        didChangeText()
+
+        let insertedLength = (replacement as NSString).length
+        if insertedLength > 0 {
+            registerAIGeneratedRange(NSRange(location: safeRange.location, length: insertedLength))
+        }
+
+        let newCursorLocation = safeRange.location + insertedLength
+        setSelectedRange(NSRange(location: newCursorLocation, length: 0))
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func registerAIGeneratedRange(_ newRange: NSRange) {
+        guard newRange.length > 0 else { return }
+        aiGeneratedRanges.append(newRange)
+        aiGeneratedRanges = Self.normalizedRanges(aiGeneratedRanges, upperBound: (string as NSString).length)
+        ensureAIGradientTimer()
+    }
+
+    private func ensureAIGradientTimer() {
+        guard aiGradientTimer == nil else { return }
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            self?.tickAIGradient()
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        aiGradientTimer = timer
+    }
+
+    private func tickAIGradient() {
+        guard !aiGeneratedRanges.isEmpty else {
+            aiGradientTimer?.invalidate()
+            aiGradientTimer = nil
+            return
+        }
+        aiGradientPhase += 0.33
+        scheduleStyling(reason: .aiAnimationTick)
+    }
+
+    private func applyAIGradientIfNeeded(to textStorage: NSTextStorage, darkMode: Bool) {
+        aiGeneratedRanges = Self.normalizedRanges(aiGeneratedRanges, upperBound: textStorage.length)
+        guard !aiGeneratedRanges.isEmpty else { return }
+
+        var paintedCharacterCount = 0
+        let maxAnimatedCharacters = 2800
+        for range in aiGeneratedRanges {
+            guard range.length > 0 else { continue }
+            for offset in 0..<range.length {
+                if paintedCharacterCount >= maxAnimatedCharacters { return }
+                let location = range.location + offset
+                guard location < textStorage.length else { continue }
+                let characterRange = NSRange(location: location, length: 1)
+                let color = aiGradientColor(characterIndex: location, darkMode: darkMode)
+                textStorage.addAttribute(.foregroundColor, value: color, range: characterRange)
+                paintedCharacterCount += 1
+            }
+        }
+    }
+
+    private func aiGradientColor(characterIndex: Int, darkMode: Bool) -> NSColor {
+        let wave = (sin((CGFloat(characterIndex) * 0.18) + aiGradientPhase) + 1) * 0.5
+        let start = darkMode
+            ? NSColor(calibratedRed: 0.54, green: 0.79, blue: 1.00, alpha: 0.98)
+            : NSColor(calibratedRed: 0.18, green: 0.50, blue: 0.94, alpha: 0.98)
+        let end = darkMode
+            ? NSColor(calibratedRed: 0.90, green: 0.62, blue: 1.00, alpha: 0.98)
+            : NSColor(calibratedRed: 0.66, green: 0.31, blue: 0.92, alpha: 0.98)
+        return Self.blendColor(start, end, factor: wave)
+    }
+
+    private static func blendColor(_ first: NSColor, _ second: NSColor, factor: CGFloat) -> NSColor {
+        let f = min(max(factor, 0), 1)
+        let c1 = first.usingColorSpace(.deviceRGB) ?? first
+        let c2 = second.usingColorSpace(.deviceRGB) ?? second
+        return NSColor(
+            calibratedRed: c1.redComponent + (c2.redComponent - c1.redComponent) * f,
+            green: c1.greenComponent + (c2.greenComponent - c1.greenComponent) * f,
+            blue: c1.blueComponent + (c2.blueComponent - c1.blueComponent) * f,
+            alpha: c1.alphaComponent + (c2.alphaComponent - c1.alphaComponent) * f
+        )
+    }
+
+    private static func normalizedRanges(_ ranges: [NSRange], upperBound: Int) -> [NSRange] {
+        let clamped = ranges
+            .map { clamp(range: $0, upperBound: upperBound) }
+            .filter { $0.length > 0 }
+            .sorted { lhs, rhs in lhs.location < rhs.location }
+
+        guard !clamped.isEmpty else { return [] }
+
+        var merged: [NSRange] = [clamped[0]]
+        for candidate in clamped.dropFirst() {
+            var tail = merged.removeLast()
+            let tailEnd = NSMaxRange(tail)
+            if candidate.location <= tailEnd {
+                let mergedEnd = max(tailEnd, NSMaxRange(candidate))
+                tail.length = mergedEnd - tail.location
+                merged.append(tail)
+            } else {
+                merged.append(tail)
+                merged.append(candidate)
+            }
+        }
+        return merged
+    }
+
     private func handleHorizontalSwipeEvent(_ event: NSEvent) {
         if event.phase == .began || event.phase == .mayBegin {
             horizontalSwipeAccumulator = 0
@@ -635,23 +822,6 @@ final class WriterTextView: NSTextView {
         if event.phase == .ended || event.phase == .cancelled || event.momentumPhase == .ended {
             horizontalSwipeAccumulator = 0
             didEmitHorizontalSwipe = false
-        }
-    }
-
-    private static func highlightColor(for partOfSpeech: PartOfSpeech, darkMode: Bool) -> NSColor {
-        switch (partOfSpeech, darkMode) {
-        case (.noun, false):
-            return NSColor(calibratedRed: 0.30, green: 0.43, blue: 0.62, alpha: 0.90)
-        case (.verb, false):
-            return NSColor(calibratedRed: 0.30, green: 0.50, blue: 0.39, alpha: 0.90)
-        case (.adjective, false):
-            return NSColor(calibratedRed: 0.55, green: 0.43, blue: 0.25, alpha: 0.90)
-        case (.noun, true):
-            return NSColor(calibratedRed: 0.58, green: 0.71, blue: 0.90, alpha: 0.92)
-        case (.verb, true):
-            return NSColor(calibratedRed: 0.55, green: 0.80, blue: 0.65, alpha: 0.92)
-        case (.adjective, true):
-            return NSColor(calibratedRed: 0.88, green: 0.76, blue: 0.53, alpha: 0.92)
         }
     }
 }

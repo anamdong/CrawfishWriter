@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var appState = AppState()
+    @ObservedObject private var externalFileOpenRouter = ExternalFileOpenRouter.shared
     @State private var isPreviewButtonHovered = false
     @Environment(\.colorScheme) private var colorScheme
 
@@ -31,7 +32,9 @@ struct ContentView: View {
                             text: $appState.text,
                             fontSize: appState.editorFontSize,
                             focusMode: appState.focusMode,
-                            onHorizontalSwipe: handlePreviewSwipe(_:)
+                            summarizeDocumentRequestID: appState.summarizeDocumentRequestID,
+                            onHorizontalSwipe: handlePreviewSwipe(_:),
+                            onAIError: { appState.errorMessage = $0 }
                         ) { editedText in
                             appState.userEdited(text: editedText)
                         }
@@ -158,6 +161,14 @@ struct ContentView: View {
         )
         .preferredColorScheme(appState.useDarkMode ? .dark : .light)
         .focusedSceneValue(\.activeAppState, appState)
+        .onAppear(perform: handlePendingExternalFiles)
+        .onReceive(externalFileOpenRouter.$eventID) { _ in
+            handlePendingExternalFiles()
+        }
+        .onOpenURL { url in
+            externalFileOpenRouter.enqueue(urls: [url])
+            handlePendingExternalFiles()
+        }
         .alert(
             "Operation Failed",
             isPresented: Binding(
@@ -181,5 +192,11 @@ struct ContentView: View {
         } else if normalizedDeltaX > 0 {
             appState.showPreviewPanel()
         }
+    }
+
+    private func handlePendingExternalFiles() {
+        let urls = externalFileOpenRouter.drainPendingFileURLs()
+        guard let firstURL = urls.first else { return }
+        appState.openDocument(at: firstURL)
     }
 }

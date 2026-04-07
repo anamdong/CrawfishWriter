@@ -5,7 +5,7 @@ EXECUTABLE_NAME="QuietWrite"
 APP_DISPLAY_NAME="Crawfish Writer"
 APP_BUNDLE_NAME="CrawfishWriter"
 APP_BUNDLE_ID="com.crawfishwriter.app"
-APP_ICON_PNG_RELATIVE_PATH="app_icon/1x/CrawfishWriter_icon_01.png"
+APP_ICON_PNG_RELATIVE_PATH="app_icon/1x/CrawfishWriter_icon_02.png"
 APP_ICON_BASENAME="CrawfishWriter"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -79,6 +79,47 @@ cat > "$INFO_PLIST" <<EOF
   <string>APPL</string>
   <key>CFBundleIconFile</key>
   <string>$APP_ICON_BASENAME</string>
+  <key>CFBundleDocumentTypes</key>
+  <array>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Text Documents</string>
+      <key>CFBundleTypeRole</key>
+      <string>Editor</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>public.plain-text</string>
+        <string>public.text</string>
+        <string>public.rtf</string>
+        <string>public.html</string>
+        <string>public.xml</string>
+        <string>public.json</string>
+        <string>public.comma-separated-values-text</string>
+        <string>public.tab-separated-values-text</string>
+      </array>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>md</string>
+        <string>markdown</string>
+        <string>txt</string>
+        <string>text</string>
+        <string>rtf</string>
+        <string>html</string>
+        <string>htm</string>
+        <string>xml</string>
+        <string>json</string>
+        <string>csv</string>
+        <string>tsv</string>
+        <string>log</string>
+        <string>yaml</string>
+        <string>yml</string>
+      </array>
+      <key>LSTypeIsPackage</key>
+      <false/>
+    </dict>
+  </array>
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>LSMinimumSystemVersion</key>
