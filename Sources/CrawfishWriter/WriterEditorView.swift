@@ -3,7 +3,9 @@ import AppKit
 
 struct WriterEditorView: NSViewRepresentable {
     @Binding var text: String
+    var fontSize: CGFloat
     var focusMode: FocusMode
+    var onHorizontalSwipe: (CGFloat) -> Void
     var onUserEdit: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -32,6 +34,10 @@ struct WriterEditorView: NSViewRepresentable {
         let textView = WriterTextView(frame: NSRect(origin: .zero, size: scrollView.contentSize), textContainer: textContainer)
         textView.delegate = context.coordinator
         textView.autoresizingMask = [.width]
+        textView.editorFontSize = fontSize
+        textView.onHorizontalSwipe = { [weak coordinator = context.coordinator] normalizedDeltaX in
+            coordinator?.handleHorizontalSwipe(normalizedDeltaX)
+        }
         textView.string = text
         textView.focusMode = focusMode
         textView.scheduleStyling(reason: .fullRefresh)
@@ -50,7 +56,11 @@ struct WriterEditorView: NSViewRepresentable {
         context.coordinator.parent = self
 
         guard let textView = context.coordinator.textView else { return }
+        textView.editorFontSize = fontSize
         textView.focusMode = focusMode
+        textView.onHorizontalSwipe = { [weak coordinator = context.coordinator] normalizedDeltaX in
+            coordinator?.handleHorizontalSwipe(normalizedDeltaX)
+        }
 
         if textView.string != text {
             context.coordinator.isApplyingExternalChange = true
@@ -103,6 +113,10 @@ struct WriterEditorView: NSViewRepresentable {
         func textViewDidChangeSelection(_ notification: Notification) {
             textView?.scheduleStyling(reason: .selectionChanged)
         }
+
+        func handleHorizontalSwipe(_ normalizedDeltaX: CGFloat) {
+            parent.onHorizontalSwipe(normalizedDeltaX)
+        }
     }
 }
 
@@ -148,7 +162,21 @@ final class WriterTextView: NSTextView {
         }
     }
 
-    private static let editorFont = NSFont.monospacedSystemFont(ofSize: 19, weight: .regular)
+    var editorFontSize: CGFloat = 17 {
+        didSet {
+            let clampedValue = Self.clampedFontSize(editorFontSize)
+            if clampedValue != editorFontSize {
+                editorFontSize = clampedValue
+                return
+            }
+            guard abs(oldValue - editorFontSize) > 0.001 else { return }
+            font = Self.editorFont(size: editorFontSize)
+            refreshTypingAttributes()
+            scheduleStyling(reason: .fullRefresh)
+        }
+    }
+    var onHorizontalSwipe: ((CGFloat) -> Void)?
+
     private static let cursorColorLight = NSColor(calibratedRed: 0.76, green: 0.46, blue: 0.46, alpha: 0.95)
     private static let cursorColorDark = NSColor(calibratedRed: 0.86, green: 0.56, blue: 0.56, alpha: 0.95)
     private static let baseParagraphStyle: NSParagraphStyle = {
@@ -164,6 +192,8 @@ final class WriterTextView: NSTextView {
     private var styleGeneration: Int = 0
     private var applyingStyle = false
     private var isUpdatingColumnLayout = false
+    private var horizontalSwipeAccumulator: CGFloat = 0
+    private var didEmitHorizontalSwipe = false
 
     override init(frame frameRect: NSRect, textContainer container: NSTextContainer?) {
         super.init(frame: frameRect, textContainer: container)
@@ -188,6 +218,28 @@ final class WriterTextView: NSTextView {
         super.viewDidChangeEffectiveAppearance()
         updateCursorColor()
         scheduleStyling(reason: .fullRefresh)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if modifiers == .command, let key = event.charactersIgnoringModifiers?.lowercased() {
+            switch key {
+            case "b":
+                applyMarkdownEmphasis(marker: "**")
+                return
+            case "i":
+                applyMarkdownEmphasis(marker: "*")
+                return
+            default:
+                break
+            }
+        }
+        super.keyDown(with: event)
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        handleHorizontalSwipeEvent(event)
+        super.scrollWheel(with: event)
     }
 
     func scheduleStyling(reason: StylingReason) {
@@ -239,7 +291,7 @@ final class WriterTextView: NSTextView {
         backgroundColor = .clear
         textColor = .labelColor
         updateCursorColor()
-        font = Self.editorFont
+        font = Self.editorFont(size: editorFontSize)
 
         isHorizontallyResizable = false
         isVerticallyResizable = true
@@ -290,7 +342,7 @@ final class WriterTextView: NSTextView {
     }
 
     private func refreshTypingAttributes() {
-        typingAttributes = Self.baseAttributes(foreground: .labelColor)
+        typingAttributes = Self.baseAttributes(foreground: .labelColor, fontSize: editorFontSize)
     }
 
     private func updateCursorColor() {
@@ -392,12 +444,21 @@ final class WriterTextView: NSTextView {
 
         textStorage.beginEditing()
         if let focusRange = plan.focusRange, focusRange.length > 0 {
-            textStorage.setAttributes(Self.baseAttributes(foreground: dimColor), range: fullRange)
+            textStorage.setAttributes(
+                Self.baseAttributes(foreground: dimColor, fontSize: editorFontSize),
+                range: fullRange
+            )
             if NSMaxRange(focusRange) <= textStorage.length {
-                textStorage.addAttributes(Self.baseAttributes(foreground: baseColor), range: focusRange)
+                textStorage.addAttributes(
+                    Self.baseAttributes(foreground: baseColor, fontSize: editorFontSize),
+                    range: focusRange
+                )
             }
         } else {
-            textStorage.setAttributes(Self.baseAttributes(foreground: baseColor), range: fullRange)
+            textStorage.setAttributes(
+                Self.baseAttributes(foreground: baseColor, fontSize: editorFontSize),
+                range: fullRange
+            )
         }
 
         for highlight in plan.highlights {
@@ -497,12 +558,84 @@ final class WriterTextView: NSTextView {
         return NSRange(location: location, length: max(0, upperRangeBound - location))
     }
 
-    private static func baseAttributes(foreground: NSColor) -> [NSAttributedString.Key: Any] {
+    private static func editorFont(size: CGFloat) -> NSFont {
+        NSFont.monospacedSystemFont(ofSize: clampedFontSize(size), weight: .regular)
+    }
+
+    private static func clampedFontSize(_ value: CGFloat) -> CGFloat {
+        min(max(value, 12), 30)
+    }
+
+    private static func baseAttributes(
+        foreground: NSColor,
+        fontSize: CGFloat
+    ) -> [NSAttributedString.Key: Any] {
         [
-            .font: editorFont,
+            .font: editorFont(size: fontSize),
             .paragraphStyle: baseParagraphStyle,
             .foregroundColor: foreground
         ]
+    }
+
+    private func applyMarkdownEmphasis(marker: String) {
+        guard isEditable else { return }
+
+        let nsText = string as NSString
+        let totalLength = nsText.length
+        let selection = Self.clamp(range: selectedRange(), upperBound: totalLength)
+        let markerLength = (marker as NSString).length
+
+        let replacement: String
+        if selection.length > 0 {
+            let selectedText = nsText.substring(with: selection)
+            replacement = "\(marker)\(selectedText)\(marker)"
+        } else {
+            replacement = "\(marker)\(marker)"
+        }
+
+        guard shouldChangeText(in: selection, replacementString: replacement) else { return }
+        textStorage?.replaceCharacters(in: selection, with: replacement)
+        didChangeText()
+
+        setSelectedRange(
+            NSRange(
+                location: selection.location + markerLength,
+                length: selection.length
+            )
+        )
+        scheduleStyling(reason: .textChanged)
+    }
+
+    private func handleHorizontalSwipeEvent(_ event: NSEvent) {
+        if event.phase == .began || event.phase == .mayBegin {
+            horizontalSwipeAccumulator = 0
+            didEmitHorizontalSwipe = false
+        }
+
+        let rawDeltaX = event.scrollingDeltaX
+        let rawDeltaY = event.scrollingDeltaY
+        guard abs(rawDeltaX) > abs(rawDeltaY), abs(rawDeltaX) > 0.01 else {
+            resetHorizontalSwipeIfEnded(event)
+            return
+        }
+
+        let normalizedDeltaX = event.isDirectionInvertedFromDevice ? -rawDeltaX : rawDeltaX
+        horizontalSwipeAccumulator += normalizedDeltaX
+
+        let threshold: CGFloat = 55
+        if !didEmitHorizontalSwipe, abs(horizontalSwipeAccumulator) >= threshold {
+            didEmitHorizontalSwipe = true
+            onHorizontalSwipe?(horizontalSwipeAccumulator)
+        }
+
+        resetHorizontalSwipeIfEnded(event)
+    }
+
+    private func resetHorizontalSwipeIfEnded(_ event: NSEvent) {
+        if event.phase == .ended || event.phase == .cancelled || event.momentumPhase == .ended {
+            horizontalSwipeAccumulator = 0
+            didEmitHorizontalSwipe = false
+        }
     }
 
     private static func highlightColor(for partOfSpeech: PartOfSpeech, darkMode: Bool) -> NSColor {

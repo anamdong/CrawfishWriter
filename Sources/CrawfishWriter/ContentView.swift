@@ -3,25 +3,35 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var appState = AppState()
     @State private var isPreviewButtonHovered = false
+    @Environment(\.colorScheme) private var colorScheme
 
     private var previewButtonTrailingPadding: CGFloat {
         appState.isPreviewPanelVisible ? 42 : 26
     }
 
+    private var editorBackgroundColor: Color {
+        if colorScheme == .dark {
+            return Color(nsColor: .textBackgroundColor)
+        }
+        return Color(nsColor: NSColor(calibratedWhite: 0.95, alpha: 1.0))
+    }
+
     var body: some View {
         ZStack(alignment: .topTrailing) {
-            Color.white
+            Color(nsColor: .windowBackgroundColor)
                 .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 HStack(spacing: 0) {
                     ZStack {
-                        Color(nsColor: .textBackgroundColor)
+                        editorBackgroundColor
                             .ignoresSafeArea()
 
                         WriterEditorView(
                             text: $appState.text,
-                            focusMode: appState.focusMode
+                            fontSize: appState.editorFontSize,
+                            focusMode: appState.focusMode,
+                            onHorizontalSwipe: handlePreviewSwipe(_:)
                         ) { editedText in
                             appState.userEdited(text: editedText)
                         }
@@ -30,7 +40,10 @@ struct ContentView: View {
                     if appState.isPreviewPanelVisible {
                         Divider()
                             .opacity(0.5)
-                        MarkdownWebPreviewView(markdown: appState.text)
+                        MarkdownWebPreviewView(
+                            markdown: appState.text,
+                            onHorizontalSwipe: handlePreviewSwipe(_:)
+                        )
                             .frame(minWidth: 340, idealWidth: 460, maxWidth: 760, maxHeight: .infinity)
                             .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
@@ -42,6 +55,50 @@ struct ContentView: View {
                         .foregroundStyle(.secondary)
 
                     Spacer()
+
+                    HStack(spacing: 8) {
+                        Button(action: { appState.decreaseEditorFontSize() }) {
+                            Image(systemName: "textformat.size.smaller")
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(appState.editorFontSize <= appState.minimumEditorFontSize)
+                        .opacity(appState.editorFontSize <= appState.minimumEditorFontSize ? 0.35 : 1.0)
+
+                        Text("\(Int(appState.editorFontSize.rounded())) pt")
+                            .frame(minWidth: 44, alignment: .trailing)
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+
+                        Button(action: { appState.increaseEditorFontSize() }) {
+                            Image(systemName: "textformat.size.larger")
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(appState.editorFontSize >= appState.maximumEditorFontSize)
+                        .opacity(appState.editorFontSize >= appState.maximumEditorFontSize ? 0.35 : 1.0)
+                    }
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.04))
+                    )
+
+                    Button(action: { appState.toggleDarkMode() }) {
+                        Label(
+                            appState.useDarkMode ? "Dark" : "Light",
+                            systemImage: appState.useDarkMode ? "moon.fill" : "sun.max.fill"
+                        )
+                        .font(.system(size: 11, weight: .medium, design: .rounded))
+                        .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        Capsule()
+                            .fill(colorScheme == .dark ? Color.white.opacity(0.08) : Color.black.opacity(0.04))
+                    )
 
                     Text("\(appState.wordCount) words  ·  \(appState.characterCount) characters")
                         .font(.system(size: 12, weight: .regular, design: .monospaced))
@@ -68,14 +125,16 @@ struct ContentView: View {
                         Capsule()
                             .fill(
                                 isPreviewButtonHovered
-                                ? Color.black.opacity(0.14)
-                                : Color.black.opacity(0.08)
+                                ? (colorScheme == .dark ? Color.white.opacity(0.14) : Color.black.opacity(0.08))
+                                : (colorScheme == .dark ? Color.white.opacity(0.09) : Color.black.opacity(0.04))
                             )
                     )
                     .overlay(
                         Capsule()
                             .stroke(
-                                Color.black.opacity(isPreviewButtonHovered ? 0.30 : 0.16),
+                                colorScheme == .dark
+                                ? Color.white.opacity(isPreviewButtonHovered ? 0.32 : 0.16)
+                                : Color.black.opacity(isPreviewButtonHovered ? 0.18 : 0.08),
                                 lineWidth: 1
                             )
                     )
@@ -97,6 +156,7 @@ struct ContentView: View {
                 appState.configure(window: window)
             }
         )
+        .preferredColorScheme(appState.useDarkMode ? .dark : .light)
         .focusedSceneValue(\.activeAppState, appState)
         .alert(
             "Operation Failed",
@@ -112,6 +172,14 @@ struct ContentView: View {
             Button("OK", role: .cancel) {}
         } message: {
             Text(appState.errorMessage ?? "")
+        }
+    }
+
+    private func handlePreviewSwipe(_ normalizedDeltaX: CGFloat) {
+        if normalizedDeltaX < 0 {
+            appState.hidePreviewPanel()
+        } else if normalizedDeltaX > 0 {
+            appState.showPreviewPanel()
         }
     }
 }

@@ -4,17 +4,19 @@ import AppKit
 
 struct MarkdownWebPreviewView: NSViewRepresentable {
     let markdown: String
+    var onHorizontalSwipe: (CGFloat) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
     }
 
-    func makeNSView(context: Context) -> WKWebView {
+    func makeNSView(context: Context) -> SwipeAwareWebView {
         let config = WKWebViewConfiguration()
-        let webView = WKWebView(frame: .zero, configuration: config)
+        let webView = SwipeAwareWebView(frame: .zero, configuration: config)
         webView.setValue(false, forKey: "drawsBackground")
         webView.allowsBackForwardNavigationGestures = false
         webView.allowsMagnification = false
+        webView.onHorizontalSwipe = onHorizontalSwipe
         configureOverlayScrollbars(for: webView)
         DispatchQueue.main.async {
             configureOverlayScrollbars(for: webView)
@@ -23,7 +25,8 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
         return webView
     }
 
-    func updateNSView(_ nsView: WKWebView, context: Context) {
+    func updateNSView(_ nsView: SwipeAwareWebView, context: Context) {
+        nsView.onHorizontalSwipe = onHorizontalSwipe
         configureOverlayScrollbars(for: nsView)
         context.coordinator.render(markdown: markdown, in: nsView)
     }
@@ -58,6 +61,50 @@ struct MarkdownWebPreviewView: NSViewRepresentable {
             guard markdown != lastMarkdown else { return }
             lastMarkdown = markdown
             webView.loadHTMLString(MarkdownWebRenderer.htmlDocument(from: markdown), baseURL: nil)
+        }
+    }
+}
+
+final class SwipeAwareWebView: WKWebView {
+    var onHorizontalSwipe: ((CGFloat) -> Void)?
+
+    private var horizontalSwipeAccumulator: CGFloat = 0
+    private var didEmitHorizontalSwipe = false
+
+    override func scrollWheel(with event: NSEvent) {
+        handleHorizontalSwipeEvent(event)
+        super.scrollWheel(with: event)
+    }
+
+    private func handleHorizontalSwipeEvent(_ event: NSEvent) {
+        if event.phase == .began || event.phase == .mayBegin {
+            horizontalSwipeAccumulator = 0
+            didEmitHorizontalSwipe = false
+        }
+
+        let rawDeltaX = event.scrollingDeltaX
+        let rawDeltaY = event.scrollingDeltaY
+        guard abs(rawDeltaX) > abs(rawDeltaY), abs(rawDeltaX) > 0.01 else {
+            resetHorizontalSwipeIfEnded(event)
+            return
+        }
+
+        let normalizedDeltaX = event.isDirectionInvertedFromDevice ? -rawDeltaX : rawDeltaX
+        horizontalSwipeAccumulator += normalizedDeltaX
+
+        let threshold: CGFloat = 55
+        if !didEmitHorizontalSwipe, abs(horizontalSwipeAccumulator) >= threshold {
+            didEmitHorizontalSwipe = true
+            onHorizontalSwipe?(horizontalSwipeAccumulator)
+        }
+
+        resetHorizontalSwipeIfEnded(event)
+    }
+
+    private func resetHorizontalSwipeIfEnded(_ event: NSEvent) {
+        if event.phase == .ended || event.phase == .cancelled || event.momentumPhase == .ended {
+            horizontalSwipeAccumulator = 0
+            didEmitHorizontalSwipe = false
         }
     }
 }
@@ -117,6 +164,7 @@ enum MarkdownWebRenderer {
               background: var(--bg);
               color: var(--fg);
               font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+              font-size: 15px;
               line-height: 1.65;
             }
             .wrap {

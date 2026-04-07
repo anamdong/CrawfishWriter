@@ -7,11 +7,20 @@ final class AppState: ObservableObject {
     @Published var text: String = ""
     @Published var isPreviewPanelVisible: Bool = false
     @Published var focusMode: FocusMode = .off
-    @Published var documentURL: URL?
-    @Published var isDirty: Bool = false
+    @Published var editorFontSize: CGFloat = 17
+    @Published var useDarkMode: Bool = false
+    @Published var documentURL: URL? {
+        didSet { refreshWindowDocumentMetadata() }
+    }
+    @Published var isDirty: Bool = false {
+        didSet { refreshWindowDocumentMetadata() }
+    }
     @Published var errorMessage: String?
 
     private weak var configuredWindow: NSWindow?
+    let minimumEditorFontSize: CGFloat = 12
+    let maximumEditorFontSize: CGFloat = 30
+    private let defaultDocumentTitle = "Untitled.md"
 
     var canExportDOCX: Bool {
         if #available(macOS 13.0, *) {
@@ -30,8 +39,35 @@ final class AppState: ObservableObject {
         isPreviewPanelVisible.toggle()
     }
 
+    func showPreviewPanel() {
+        isPreviewPanelVisible = true
+    }
+
+    func hidePreviewPanel() {
+        isPreviewPanelVisible = false
+    }
+
     func cycleFocusMode() {
         focusMode = focusMode.next()
+    }
+
+    func increaseEditorFontSize() {
+        setEditorFontSize(editorFontSize + 1)
+    }
+
+    func decreaseEditorFontSize() {
+        setEditorFontSize(editorFontSize - 1)
+    }
+
+    func setEditorFontSize(_ newValue: CGFloat) {
+        editorFontSize = min(max(newValue, minimumEditorFontSize), maximumEditorFontSize)
+    }
+
+    func toggleDarkMode() {
+        useDarkMode.toggle()
+        if let configuredWindow {
+            applyAppearance(to: configuredWindow)
+        }
     }
 
     var characterCount: Int {
@@ -53,7 +89,7 @@ final class AppState: ObservableObject {
             window.styleMask.insert(.miniaturizable)
             window.styleMask.insert(.resizable)
             window.styleMask.insert(.fullSizeContentView)
-            window.titleVisibility = .hidden
+            window.titleVisibility = .visible
             window.titlebarAppearsTransparent = true
             window.toolbar = nil
             window.tabbingMode = .disallowed
@@ -61,7 +97,6 @@ final class AppState: ObservableObject {
             window.collectionBehavior.insert(.fullScreenPrimary)
             window.collectionBehavior.insert(.fullScreenAllowsTiling)
             window.backgroundColor = .textBackgroundColor
-            window.title = "Crawfish Writer"
             if #available(macOS 11.0, *) {
                 window.titlebarSeparatorStyle = .none
             }
@@ -77,6 +112,27 @@ final class AppState: ObservableObject {
                 control.isEnabled = true
                 control.alphaValue = 1
             }
+        }
+
+        applyAppearance(to: window)
+        refreshWindowDocumentMetadata()
+    }
+
+    private func applyAppearance(to window: NSWindow) {
+        window.appearance = NSAppearance(named: useDarkMode ? .darkAqua : .aqua)
+        window.backgroundColor = .windowBackgroundColor
+    }
+
+    private func refreshWindowDocumentMetadata() {
+        guard let window = configuredWindow else { return }
+
+        window.title = documentURL?.lastPathComponent ?? defaultDocumentTitle
+        window.representedURL = documentURL
+        window.isDocumentEdited = isDirty
+
+        if let documentIconButton = window.standardWindowButton(.documentIconButton) {
+            documentIconButton.isHidden = documentURL == nil
+            documentIconButton.isEnabled = documentURL != nil
         }
     }
 
