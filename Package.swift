@@ -12,7 +12,7 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "QuietWrite",
-            path: "Sources/QuietWrite"
+            path: "Sources/CrawfishWriter"
         )
     ]
 )
